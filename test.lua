@@ -1,7 +1,7 @@
 -- Chess! Stockfish move overlay
 -- Replace the API key below with your Railway API_KEY value.
 local API_URL = "https://stockfish-api22-production.up.railway.app/api/analyze"
-local API_KEY = "YOUR_RAILWAY_API_KEY"
+local API_KEY = "4b534n6234243b62436g436246b43624fkm756b32b343b46n3"
 
 local STRENGTH = "high"
 local PLAY_AS = "White"
