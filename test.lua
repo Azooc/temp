@@ -1,7 +1,7 @@
--- Chess! Stockfish move overlay - diagnostics v5, calibrated colors
+-- Chess! Stockfish move overlay - diagnostics v6, calibrated colors
 -- This message MUST appear as soon as this exact version runs.
-print("[Stockfish v5] SCRIPT STARTED - GitHub test.lua is loading")
-warn("[Stockfish v5] Startup diagnostics enabled")
+print("[Stockfish v6] SCRIPT STARTED - GitHub test.lua is loading")
+warn("[Stockfish v6] Startup diagnostics enabled")
 -- Replace the API key below with your Railway API_KEY value.
 local API_URL = "https://stockfish-api22-production.up.railway.app/api/analyze"
 local API_KEY = "4b534n6234243b62436g436246b43624fkm756b32b343b46n3"
@@ -24,7 +24,7 @@ local RunService = game:GetService("RunService")
 local board, piecesFolder
 for try = 1, 60 do
     if try == 1 or try % 10 == 0 then
-        print("[Stockfish v5] Waiting for workspace.Board / workspace.Pieces, check", try)
+        print("[Stockfish v6] Waiting for workspace.Board / workspace.Pieces, check", try)
     end
     board = workspace:FindFirstChild("Board")
     piecesFolder = workspace:FindFirstChild("Pieces")
@@ -33,10 +33,10 @@ for try = 1, 60 do
 end
 
 if not board or not piecesFolder then
-    warn("[Stockfish v5] Board missing:", tostring(not board), "Pieces missing:", tostring(not piecesFolder))
+    warn("[Stockfish v6] Board missing:", tostring(not board), "Pieces missing:", tostring(not piecesFolder))
     error("Workspace chess board not found. Expected workspace.Board and workspace.Pieces")
 end
-print("[Stockfish v5] Found board and pieces folder. Piece models:", #piecesFolder:GetChildren())
+print("[Stockfish v6] Found board and pieces folder. Piece models:", #piecesFolder:GetChildren())
 
 local arrows = {}
 local arrowFrom, arrowTo
@@ -133,7 +133,7 @@ local function calibrateSides()
         and kingSquares.White == 1 and kingSquares.Black == 1
     if not good then
         if os.clock() - lastCalibrateWarning > 6 then
-            warn("[Stockfish v5] CALIBRATION NOT READY: White=" .. counts.White ..
+            warn("[Stockfish v6] CALIBRATION NOT READY: White=" .. counts.White ..
                 " Black=" .. counts.Black .. ". Start on a new board or right after White's opening move.")
             lastCalibrateWarning = os.clock()
         end
@@ -153,12 +153,12 @@ local function calibrateSides()
         appearanceVotes[appearance] = votes
         if entry.model.Name == "King" then
             local c = entry.mesh.Color
-            print(string.format("[Stockfish v5] %s King @%s Mesh RGB=(%.3f, %.3f, %.3f)",
+            print(string.format("[Stockfish v6] %s King @%s Mesh RGB=(%.3f, %.3f, %.3f)",
                 entry.side, entry.square, c.R, c.G, c.B))
         end
     end
     calibrated = true
-    print("[Stockfish v5] COLOR CALIBRATED: 16 White / 16 Black pieces")
+    print("[Stockfish v6] COLOR CALIBRATED: 16 White / 16 Black pieces")
     return true
 end
 
@@ -179,7 +179,7 @@ local function pieceType(model, square)
     end
     if not side and square then
         side = tonumber(square:sub(2,2)) <= 4 and "White" or "Black"
-        warn("[Stockfish v5] New piece without known color at " .. square ..
+        warn("[Stockfish v6] New piece without known color at " .. square ..
             "; inferred " .. side .. ".")
     end
     if not side then return nil end
@@ -295,18 +295,18 @@ _G.__ChessStockfishStop = function()
     print("[Stockfish] Previous overlay stopped.")
 end
 
--- Draw the move arrow using the current camera. No custom WorldToScreen required.
+-- Matcha provides the WorldToScreen global used by the original working overlay.
+-- It does NOT expose Camera:WorldToViewportPoint. Catch errors once instead of
+-- flooding Matcha output every rendered frame.
+local projectionWarned = false
 renderConnection = RunService.RenderStepped:Connect(function()
     if not arrowFrom or not arrowTo then return end
 
     for _, arrow in ipairs(arrows) do
-        arrow.line:Remove()
-        arrow.head:Remove()
+        pcall(function() arrow.line:Remove() end)
+        pcall(function() arrow.head:Remove() end)
     end
     arrows = {}
-
-    local camera = workspace.CurrentCamera
-    if not camera then return end
 
     local function screen(square)
         local file = string.byte(square:sub(1, 1)) - 96
@@ -314,8 +314,18 @@ renderConnection = RunService.RenderStepped:Connect(function()
         local part = board:FindFirstChild(tostring(file) .. "," .. tostring(rank))
         if not part then return nil end
 
-        local point, visible = camera:WorldToViewportPoint(part.Position + Vector3.new(0, 1, 0))
-        return visible and Vector2.new(point.X, point.Y) or nil
+        local ok, point, visible = pcall(function()
+            return WorldToScreen(part.Position + Vector3.new(0, 1, 0))
+        end)
+        if not ok then
+            if not projectionWarned then
+                warn("[Stockfish v6] WorldToScreen failed: " .. tostring(point))
+                projectionWarned = true
+            end
+            return nil
+        end
+        if not visible or not point then return nil end
+        return Vector2.new(point.X, point.Y)
     end
 
     local fromPoint, toPoint = screen(arrowFrom), screen(arrowTo)
@@ -484,7 +494,7 @@ local function recommend(snapshot, types)
 
     print("[Stockfish] Analyzing", expected, "| selected:", PLAY_AS, "| FEN:", fen)
     if API_KEY == "YOUR_RAILWAY_API_KEY" then
-        warn("[Stockfish v5] Set your actual Railway API_KEY at top of test.lua")
+        warn("[Stockfish v6] Set your actual Railway API_KEY at top of test.lua")
         return false
     end
 
@@ -554,7 +564,7 @@ local function recommend(snapshot, types)
     return true
 end
 
-print("[Stockfish v5] UI initialized, scan starting. API:", API_URL)
+print("[Stockfish v6] UI initialized, scan starting. API:", API_URL)
 local ok, current, types = pcall(scan)
 assert(ok, current)
 
@@ -567,14 +577,14 @@ while running and not usableSnapshot(current, types) do
             if types[token] == "White King" then white += 1 end
             if types[token] == "Black King" then black += 1 end
         end
-        warn("[Stockfish v5] SCAN BLOCKED: pieces=" .. n ..
+        warn("[Stockfish v6] SCAN BLOCKED: pieces=" .. n ..
             " whiteKings=" .. white .. " blackKings=" .. black)
         local samples = {}
         for token, square in pairs(current) do
             samples[#samples+1] = tostring(types[token]) .. "@" .. tostring(square)
             if #samples >= 8 then break end
         end
-        print("[Stockfish v5] Detected piece examples: " .. table.concat(samples, ", "))
+        print("[Stockfish v6] Detected piece examples: " .. table.concat(samples, ", "))
         lastScanWarning = os.clock()
     end
     task.wait(0.5)
@@ -583,7 +593,7 @@ while running and not usableSnapshot(current, types) do
 end
 if not running then return end
 
-print("[Stockfish v5] Scan passed; both kings detected. Tracking turns.")
+print("[Stockfish v6] Scan passed; both kings detected. Tracking turns.")
 previous, previousTypes = current, types
 local initialTurn = detectOpeningTurn(current, types)
 if initialTurn ~= nil then
