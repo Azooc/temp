@@ -1,4 +1,7 @@
--- Chess! Stockfish move overlay
+-- Chess! Stockfish move overlay - diagnostics v4
+-- This message MUST appear as soon as this exact version runs.
+print("[Stockfish v4] SCRIPT STARTED - GitHub test.lua is loading")
+warn("[Stockfish v4] Startup diagnostics enabled")
 -- Replace the API key below with your Railway API_KEY value.
 local API_URL = "https://stockfish-api22-production.up.railway.app/api/analyze"
 local API_KEY = "4b534n6234243b62436g436246b43624fkm756b32b343b46n3"
@@ -19,7 +22,10 @@ local HttpService = game:GetService("HttpService")
 local RunService = game:GetService("RunService")
 
 local board, piecesFolder
-for _ = 1, 60 do
+for try = 1, 60 do
+    if try == 1 or try % 10 == 0 then
+        print("[Stockfish v4] Waiting for workspace.Board / workspace.Pieces, check", try)
+    end
     board = workspace:FindFirstChild("Board")
     piecesFolder = workspace:FindFirstChild("Pieces")
     if board and piecesFolder then break end
@@ -27,8 +33,10 @@ for _ = 1, 60 do
 end
 
 if not board or not piecesFolder then
+    warn("[Stockfish v4] Board missing:", tostring(not board), "Pieces missing:", tostring(not piecesFolder))
     error("Workspace chess board not found. Expected workspace.Board and workspace.Pieces")
 end
+print("[Stockfish v4] Found board and pieces folder. Piece models:", #piecesFolder:GetChildren())
 
 local arrows = {}
 local arrowFrom, arrowTo
@@ -439,21 +447,27 @@ local function recommend(snapshot, types)
     return true
 end
 
-print("[Stockfish] Overlay v3 loaded. API:", API_URL)
+print("[Stockfish v4] UI initialized, scan starting. API:", API_URL)
 local ok, current, types = pcall(scan)
 assert(ok, current)
 
-local lastScanWarning = 0
+local lastScanWarning = -math.huge
 while running and not usableSnapshot(current, types) do
-    if os.clock() - lastScanWarning > 5 then
+    if os.clock() - lastScanWarning >= 3 then
         local n, white, black = 0, 0, 0
         for token in pairs(current) do
             n += 1
             if types[token] == "White King" then white += 1 end
             if types[token] == "Black King" then black += 1 end
         end
-        warn("[Stockfish] Waiting for board: pieces=" .. n ..
+        warn("[Stockfish v4] SCAN BLOCKED: pieces=" .. n ..
             " whiteKings=" .. white .. " blackKings=" .. black)
+        local samples = {}
+        for token, square in pairs(current) do
+            samples[#samples+1] = tostring(types[token]) .. "@" .. tostring(square)
+            if #samples >= 8 then break end
+        end
+        print("[Stockfish v4] Detected piece examples: " .. table.concat(samples, ", "))
         lastScanWarning = os.clock()
     end
     task.wait(0.5)
@@ -462,6 +476,7 @@ while running and not usableSnapshot(current, types) do
 end
 if not running then return end
 
+print("[Stockfish v4] Scan passed; both kings detected. Tracking turns.")
 previous, previousTypes = current, types
 local initialTurn = detectOpeningTurn(current, types)
 if initialTurn ~= nil then
