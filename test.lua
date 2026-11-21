@@ -6,6 +6,14 @@ local API_KEY = "4b534n6234243b62436g436246b43624fkm756b32b343b46n3"
 local STRENGTH = "high"
 local PLAY_AS = "White"
 local SCAN_DELAY = 0.1
+local RETRY_SECONDS = 6
+
+-- Stop a previous copy of THIS version when reloading.
+-- An older version without this hook still requires rejoining the game.
+if _G.__ChessStockfishStop then
+    pcall(_G.__ChessStockfishStop)
+end
+local running = true
 
 local HttpService = game:GetService("HttpService")
 local RunService = game:GetService("RunService")
@@ -28,8 +36,11 @@ local previous, previousTypes = {}, {}
 local whiteToMove = true
 local newGameRequested = false
 local playAsChanged = false
-local lastSentFen = nil
 local requestVersion = 0
+local renderConnection
+local lastSuccessfulFen = nil
+local lastAttemptedFen = nil
+local lastAttemptTime = -math.huge
 
 local PLAY_OPTIONS = {"White", "Black", "Any"}
 local STRENGTH_OPTIONS = {"Low", "Medium", "High"}
@@ -85,14 +96,19 @@ local function scan()
     return result, types
 end
 
-local function sameSnapshot(a, b)
-    for token, square in pairs(a) do
-        if b[token] ~= square then return false end
+-- Compare board contents rather than model identity; a game may replace
+-- model instances without changing the position.
+local function boardSignature(snapshot, types)
+    local entries = {}
+    for token, square in pairs(snapshot) do
+        entries[#entries + 1] = square .. ":" .. (types[token] or "Unknown")
     end
-    for token in pairs(b) do
-        if a[token] == nil then return false end
-    end
-    return true
+    table.sort(entries)
+    return table.concat(entries, "|")
+end
+
+local function samePosition(s1, t1, s2, t2)
+    return boardSignature(s1, t1) == boardSignature(s2, t2)
 end
 
 local function usableSnapshot(snapshot, types)
@@ -158,8 +174,18 @@ local function setArrow(fromSquare, toSquare)
     arrowFrom, arrowTo = fromSquare, toSquare
 end
 
+_G.__ChessStockfishStop = function()
+    running = false
+    requestVersion += 1
+    if renderConnection then
+        pcall(function() renderConnection:Disconnect() end)
+    end
+    clearArrow()
+    print("[Stockfish] Previous overlay stopped.")
+end
+
 -- Draw the move arrow using the current camera. No custom WorldToScreen required.
-RunService.RenderStepped:Connect(function()
+renderConnection = RunService.RenderStepped:Connect(function()
     if not arrowFrom or not arrowTo then return end
 
     for _, arrow in ipairs(arrows) do
@@ -211,28 +237,45 @@ end)
 
 local function optionIndex(options, value)
     for i, name in ipairs(options) do
-        if string.lower(name) == string.lower(value) then return i - 1 end
+        if string.lower(name) == string.lower(tostring(value)) then return i - 1 end
     end
     return 0
 end
 
+local function normalizeChoice(options, value)
+    if type(value) == "number" then
+        return options[value + 1]  -- zero-based choices used by this UI
+    end
+    for _, option in ipairs(options) do
+        if string.lower(option) == string.lower(tostring(value)) then
+            return option
+        end
+    end
+    return nil
+end
+
+local forceAnalyze = false
 if UI and UI.AddTab then
     UI.AddTab("Chess AI", function(tab)
         local settings = tab:Section("Game Settings", "Left")
-
         settings:Combo("chess_play_as", "Play as", PLAY_OPTIONS,
             optionIndex(PLAY_OPTIONS, PLAY_AS), function(_, value)
-                if value and value ~= PLAY_AS then
-                    PLAY_AS = value
+                local chosen = normalizeChoice(PLAY_OPTIONS, value)
+                if chosen and chosen ~= PLAY_AS then
+                    PLAY_AS = chosen
                     playAsChanged = true
                     invalidateRecommendation()
+                    print("[Stockfish] Selected side:", PLAY_AS)
+                elseif not chosen then
+                    warn("[Stockfish] Unrecognized Play as option:", tostring(value))
                 end
             end)
 
         settings:Combo("chess_strength", "Strength", STRENGTH_OPTIONS,
             optionIndex(STRENGTH_OPTIONS, STRENGTH), function(_, value)
-                if value then
-                    STRENGTH = string.lower(value)
+                local chosen = normalizeChoice(STRENGTH_OPTIONS, value)
+                if chosen then
+                    STRENGTH = string.lower(chosen)
                     playAsChanged = true
                     invalidateRecommendation()
                 end
@@ -243,18 +286,23 @@ if UI and UI.AddTab then
             invalidateRecommendation()
         end)
 
-        -- Useful when starting midway through a match; the board alone
-        -- cannot reveal whose turn it is after both sides have moved.
         settings:Button("Sync Turn to My Color", function()
             if PLAY_AS == "White" or PLAY_AS == "Black" then
                 whiteToMove = PLAY_AS == "White"
                 playAsChanged = true
                 invalidateRecommendation()
+                print("[Stockfish] Turn synced to:", PLAY_AS)
             end
         end)
 
+        settings:Button("Analyze Now", function()
+            forceAnalyze = true
+            invalidateRecommendation()
+        end)
         settings:Text("Green arrow = recommended move")
     end)
+else
+    warn("[Stockfish] UI.AddTab not found; default selected side is " .. PLAY_AS)
 end
 
 -- Detect a fresh board, or a board immediately after the opening move.
@@ -285,102 +333,91 @@ local function detectOpeningTurn(snapshot, types)
     return nil
 end
 
--- Identify the color of the actual moved piece rather than blindly
--- toggling on every change. This avoids capture-removal false turns.
+-- Detect movement from actual occupied squares, even when the game replaces
+-- piece models. A capture removes the victim but adds no victim piece, so it
+-- cannot be mistaken for a second turn.
 local function detectMovedSide(before, beforeTypes, after, afterTypes)
-    local mover
+    local oldAt, newAt = {}, {}
+    for token, square in pairs(before) do oldAt[square] = beforeTypes[token] end
+    for token, square in pairs(after) do newAt[square] = afterTypes[token] end
 
-    for token, newSquare in pairs(after) do
-        local oldSquare = before[token]
-        if oldSquare and oldSquare ~= newSquare then
-            local kind = afterTypes[token] or beforeTypes[token]
-            local color = kind and kind:match("^(%a+) ")
-            if color == "White" or color == "Black" then
-                if mover and mover ~= color then return nil end
-                mover = color
-            end
-        end
-    end
-
-    if mover then return mover end
-
-    -- Fallback for games that replace the moving model instead of moving it.
-    local added, removed = {White = 0, Black = 0}, {White = 0, Black = 0}
-    for token in pairs(after) do
-        if before[token] == nil then
-            local kind = afterTypes[token]
-            local color = kind and kind:match("^(%a+) ")
-            if added[color] then added[color] += 1 end
-        end
-    end
-    for token in pairs(before) do
-        if after[token] == nil then
-            local kind = beforeTypes[token]
-            local color = kind and kind:match("^(%a+) ")
+    local removed = {White = 0, Black = 0}
+    local added = {White = 0, Black = 0}
+    for square, piece in pairs(oldAt) do
+        if newAt[square] ~= piece then
+            local color = piece and piece:match("^(%a+) ")
             if removed[color] then removed[color] += 1 end
         end
     end
+    for square, piece in pairs(newAt) do
+        if oldAt[square] ~= piece then
+            local color = piece and piece:match("^(%a+) ")
+            if added[color] then added[color] += 1 end
+        end
+    end
 
-    if added.White > 0 and removed.White > 0 and added.Black == 0 then return "White" end
-    if added.Black > 0 and removed.Black > 0 and added.White == 0 then return "Black" end
+    if removed.White > 0 and added.White > 0
+        and added.Black == 0 then return "White" end
+    if removed.Black > 0 and added.Black > 0
+        and added.White == 0 then return "Black" end
     return nil
 end
 
 local function recommend(snapshot, types)
+    if not running then return false end
     local fen = makeFen(snapshot, types)
+    local expected = whiteToMove and "White" or "Black"
     local body = HttpService:JSONEncode({fen = fen, strength = STRENGTH})
     requestVersion += 1
     local myVersion = requestVersion
+
+    print("[Stockfish] Analyzing", expected, "| selected:", PLAY_AS, "| FEN:", fen)
+
     local result
-
-    for _ = 1, 2 do
-        if requestVersion ~= myVersion then return false end
-
+    for attempt = 1, 2 do
+        if not running or requestVersion ~= myVersion then return false end
         local posted, raw = pcall(function()
             return httppost(API_URL, body, "application/json", {
                 ["Content-Type"] = "application/json",
                 ["x-api-key"] = API_KEY
             })
         end)
-
         local response
         if posted and type(raw) == "table" then
+            print("[Stockfish] HTTP status:", raw.StatusCode or raw.status or "unknown")
             response = raw.Body or raw.body or HttpService:JSONEncode(raw)
         else
             response = tostring(raw)
         end
-
-        if requestVersion ~= myVersion then return false end
+        if not running or requestVersion ~= myVersion then return false end
 
         local decoded, parsed = pcall(function()
             return HttpService:JSONDecode(response)
         end)
-
         if decoded and type(parsed) == "table" and parsed.bestmove then
             result = parsed
             break
         end
-
-        warn("[Stockfish] API request failed: " .. response)
-        task.wait(0.35)
+        warn("[Stockfish] Analysis attempt " .. attempt .. " failed: " .. response)
+        if attempt < 2 then task.wait(0.35) end
     end
 
-    if requestVersion ~= myVersion then return false end
+    if not running or requestVersion ~= myVersion then return false end
     if not result then
-        warn("[Stockfish] Failed to get a move.")
+        warn("[Stockfish] No bestmove returned; Analyze Now retries the same position.")
         return false
     end
 
-    -- A move may have occurred while the HTTP request was running.
-    local scanOk, live = pcall(scan)
-    if not scanOk or not sameSnapshot(snapshot, live) then
-        warn("[Stockfish] Board changed during analysis; ignoring stale move.")
+    -- Use board content, not unstable instance identity, to reject stale moves.
+    local scanOK, live, liveTypes = pcall(scan)
+    if not scanOK or not samePosition(snapshot, types, live, liveTypes) then
+        warn("[Stockfish] Position changed during analysis; waiting for it to settle.")
         return false
     end
 
     local uci = tostring(result.bestmove):match("([a-h][1-8][a-h][1-8][qrbn]?)")
     if not uci then
-        warn("[Stockfish] Invalid move: " .. tostring(result.bestmove))
+        warn("[Stockfish] Invalid bestmove: " .. tostring(result.bestmove))
         return false
     end
 
@@ -392,36 +429,46 @@ local function recommend(snapshot, types)
             break
         end
     end
-
-    -- If the service recommends a piece of the wrong color, don't draw it.
-    local expected = whiteToMove and "White" or "Black"
     if moving:sub(1, #expected) ~= expected then
-        warn("[Stockfish] Ignored move for " .. moving .. "; expected " .. expected)
+        warn("[Stockfish] Rejected " .. uci .. " for " .. moving ..
+            ", expected " .. expected .. ". Use Sync Turn to My Color if necessary.")
         return false
     end
-
     setArrow(fromSquare, toSquare)
-    print("[Stockfish] " .. expected .. " move " .. fromSquare .. " -> " .. toSquare)
+    print("[Stockfish] Arrow:", fromSquare, "->", toSquare, "(", moving, ")")
     return true
 end
 
+print("[Stockfish] Overlay v3 loaded. API:", API_URL)
 local ok, current, types = pcall(scan)
 assert(ok, current)
 
-while not usableSnapshot(current, types) do
-    task.wait(0.5)
-    local retryOk, retryCurrent, retryTypes = pcall(scan)
-    if retryOk then
-        current, types = retryCurrent, retryTypes
+local lastScanWarning = 0
+while running and not usableSnapshot(current, types) do
+    if os.clock() - lastScanWarning > 5 then
+        local n, white, black = 0, 0, 0
+        for token in pairs(current) do
+            n += 1
+            if types[token] == "White King" then white += 1 end
+            if types[token] == "Black King" then black += 1 end
+        end
+        warn("[Stockfish] Waiting for board: pieces=" .. n ..
+            " whiteKings=" .. white .. " blackKings=" .. black)
+        lastScanWarning = os.clock()
     end
+    task.wait(0.5)
+    local nextOK, nextSnapshot, nextTypes = pcall(scan)
+    if nextOK then current, types = nextSnapshot, nextTypes end
 end
+if not running then return end
 
 previous, previousTypes = current, types
 local initialTurn = detectOpeningTurn(current, types)
 if initialTurn ~= nil then
     whiteToMove = initialTurn
 else
-    warn("[Stockfish] Started in the middle of a game; use Sync Turn to My Color if needed.")
+    warn("[Stockfish] Midgame start: turn cannot be inferred from pieces alone.")
+    warn("[Stockfish] Select your color and click Sync Turn to My Color.")
 end
 
 local function isMyTurn()
@@ -430,69 +477,101 @@ local function isMyTurn()
         or (PLAY_AS == "Black" and not whiteToMove)
 end
 
-if isMyTurn() then recommend(current, types) end
+local function maybeAnalyze(snapshot, snapshotTypes, force)
+    if not usableSnapshot(snapshot, snapshotTypes) then return end
+    if not isMyTurn() then return end
+    local fen = makeFen(snapshot, snapshotTypes)
+    if not force and fen == lastSuccessfulFen then return end
+    if not force and fen == lastAttemptedFen
+        and (os.clock() - lastAttemptTime) < RETRY_SECONDS then return end
 
-while true do
+    lastAttemptedFen = fen
+    lastAttemptTime = os.clock()
+    if recommend(snapshot, snapshotTypes) then
+        lastSuccessfulFen = fen
+    end
+end
+
+print("[Stockfish] Detected turn:", whiteToMove and "White" or "Black", "| selected:", PLAY_AS)
+if isMyTurn() then
+    maybeAnalyze(current, types, true)
+else
+    print("[Stockfish] Waiting for selected side's turn. Change Play as if necessary.")
+end
+
+local candidateSignature = boardSignature(previous, previousTypes)
+local candidateSince = os.clock()
+while running do
     task.wait(SCAN_DELAY)
-
-    local success, nextSnapshot, nextTypes = pcall(scan)
-    if not success then continue end
+    local scanOK, nextSnapshot, nextTypes = pcall(scan)
+    if not scanOK then
+        warn("[Stockfish] Scanner error:", tostring(nextSnapshot))
+        continue
+    end
 
     if newGameRequested then
-        previous, previousTypes = nextSnapshot, nextTypes
-        lastSentFen = nil
-        whiteToMove = detectOpeningTurn(nextSnapshot, nextTypes)
-        if whiteToMove == nil then whiteToMove = true end
         newGameRequested = false
+        previous, previousTypes = nextSnapshot, nextTypes
+        candidateSignature = boardSignature(nextSnapshot, nextTypes)
+        candidateSince = os.clock()
+        lastSuccessfulFen = nil
+        lastAttemptedFen = nil
+        local turn = detectOpeningTurn(nextSnapshot, nextTypes)
+        if turn ~= nil then whiteToMove = turn end
         invalidateRecommendation()
-        if usableSnapshot(nextSnapshot, nextTypes) and isMyTurn() then
-            recommend(nextSnapshot, nextTypes)
-        end
+        print("[Stockfish] New Game; turn:", whiteToMove and "White" or "Black")
+        maybeAnalyze(nextSnapshot, nextTypes, true)
         continue
     end
 
     if playAsChanged then
         playAsChanged = false
         invalidateRecommendation()
-        if usableSnapshot(nextSnapshot, nextTypes) and isMyTurn() then
-            recommend(nextSnapshot, nextTypes)
-        end
+        print("[Stockfish] Selection updated; turn:", whiteToMove and "White" or "Black",
+            "| playing:", PLAY_AS)
+        maybeAnalyze(nextSnapshot, nextTypes, true)
+        continue
+    end
+
+    if forceAnalyze then
+        forceAnalyze = false
+        invalidateRecommendation()
+        maybeAnalyze(nextSnapshot, nextTypes, true)
         continue
     end
 
     if not usableSnapshot(nextSnapshot, nextTypes) then
-        invalidateRecommendation()
-        continue
+        continue  -- transient animations can remove a model temporarily
     end
 
-    if not sameSnapshot(previous, nextSnapshot) then
-        invalidateRecommendation()
+    local liveSignature = boardSignature(nextSnapshot, nextTypes)
+    if liveSignature ~= candidateSignature then
+        candidateSignature = liveSignature
+        candidateSince = os.clock()
+    end
 
-        -- Wait for animations, captures, and piece placement to settle.
-        task.wait(0.1)
-        local stable, confirmed = pcall(scan)
-        if not stable or not sameSnapshot(nextSnapshot, confirmed) then continue end
+    if not samePosition(previous, previousTypes, nextSnapshot, nextTypes) then
+        -- Allow the position to remain still before treating it as a move.
+        if os.clock() - candidateSince < 0.35 then continue end
 
-        task.wait(0.1)
-        local stableAgain, settled, settledTypes = pcall(scan)
-        if not stableAgain or not sameSnapshot(confirmed, settled) then continue end
-
-        local movedSide = detectMovedSide(previous, previousTypes, settled, settledTypes)
+        local movedSide = detectMovedSide(previous, previousTypes, nextSnapshot, nextTypes)
         if not movedSide then
-            -- A piece may have been removed before the moving piece changed square.
-            -- Don't advance turns until a real move is detected.
+            -- Don't flip the turn on an uncertain/capture-animation state.
+            -- This warning only repeats if an unresolved board change persists.
+            if os.clock() - lastScanWarning > 5 then
+                warn("[Stockfish] Board changed but moving side is unclear. Use Sync Turn to My Color.")
+                lastScanWarning = os.clock()
+            end
             continue
         end
 
-        previous, previousTypes = settled, settledTypes
+        previous, previousTypes = nextSnapshot, nextTypes
         whiteToMove = movedSide == "Black"
-
-        local settledFen = makeFen(settled, settledTypes)
-        if settledFen ~= lastSentFen then
-            lastSentFen = settledFen
-            if isMyTurn() then
-                recommend(settled, settledTypes)
-            end
-        end
+        invalidateRecommendation()
+        print("[Stockfish] Moved:", movedSide, "| now:", whiteToMove and "White" or "Black")
+        maybeAnalyze(nextSnapshot, nextTypes, true)
+    else
+        -- Retry a failed/stale API request on an unchanged position.
+        maybeAnalyze(nextSnapshot, nextTypes, false)
     end
 end
