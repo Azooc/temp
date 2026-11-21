@@ -1,4 +1,4 @@
-local API_URL = "stockfish-api22-production.up.railway.app"
+local API_URL = "https://stockfish-api22-production.up.railway.app"
 local API_KEY = "4b534n6234243b62436g436246b43624fkm756b32b343b46n3"
 local STRENGTH = "high"
 local PLAY_AS = "White"
