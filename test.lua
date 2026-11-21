@@ -1,10 +1,10 @@
--- Chess! Stockfish move overlay - diagnostics v4
+-- Chess! Stockfish move overlay - diagnostics v5, calibrated colors
 -- This message MUST appear as soon as this exact version runs.
-print("[Stockfish v4] SCRIPT STARTED - GitHub test.lua is loading")
-warn("[Stockfish v4] Startup diagnostics enabled")
+print("[Stockfish v5] SCRIPT STARTED - GitHub test.lua is loading")
+warn("[Stockfish v5] Startup diagnostics enabled")
 -- Replace the API key below with your Railway API_KEY value.
 local API_URL = "https://stockfish-api22-production.up.railway.app/api/analyze"
-local API_KEY = "4b534n6234243b62436g436246b43624fkm756b32b343b46n3"
+local API_KEY = "YOUR_RAILWAY_API_KEY"
 
 local STRENGTH = "high"
 local PLAY_AS = "White"
@@ -24,7 +24,7 @@ local RunService = game:GetService("RunService")
 local board, piecesFolder
 for try = 1, 60 do
     if try == 1 or try % 10 == 0 then
-        print("[Stockfish v4] Waiting for workspace.Board / workspace.Pieces, check", try)
+        print("[Stockfish v5] Waiting for workspace.Board / workspace.Pieces, check", try)
     end
     board = workspace:FindFirstChild("Board")
     piecesFolder = workspace:FindFirstChild("Pieces")
@@ -33,10 +33,10 @@ for try = 1, 60 do
 end
 
 if not board or not piecesFolder then
-    warn("[Stockfish v4] Board missing:", tostring(not board), "Pieces missing:", tostring(not piecesFolder))
+    warn("[Stockfish v5] Board missing:", tostring(not board), "Pieces missing:", tostring(not piecesFolder))
     error("Workspace chess board not found. Expected workspace.Board and workspace.Pieces")
 end
-print("[Stockfish v4] Found board and pieces folder. Piece models:", #piecesFolder:GetChildren())
+print("[Stockfish v5] Found board and pieces folder. Piece models:", #piecesFolder:GetChildren())
 
 local arrows = {}
 local arrowFrom, arrowTo
@@ -73,34 +73,137 @@ local function positionToSquare(position)
     return squareName(file, rank)
 end
 
-local function pieceType(model)
-    local mesh = model:FindFirstChild("Mesh")
-    if not mesh then return nil end
+-- Color3.R > 0.5 is NOT a reliable piece-color test in this game:
+-- both kings were being detected as White.  Calibrate using the initial
+-- positions of pieces, then remember each model's side as it moves.
+local sideByModel = setmetatable({}, {__mode = "k"})
+local sideByAddress = {}
+local appearanceVotes = {}
+local cachedSquareTypes = {}
+local calibrated = false
+local lastCalibrateWarning = -math.huge
 
-    -- Roblox Color3 channels run from 0 to 1, not 0 to 255.
-    local side = mesh.Color.R > 0.5 and "White" or "Black"
-    local kind = model.Name
-    if kind ~= "Pawn" and kind ~= "Knight" and kind ~= "Bishop"
-        and kind ~= "Rook" and kind ~= "Queen" and kind ~= "King" then
-        return nil
+local function validKind(kind)
+    return kind == "Pawn" or kind == "Knight" or kind == "Bishop"
+        or kind == "Rook" or kind == "Queen" or kind == "King"
+end
+
+local function addressFor(model)
+    local ok, value = pcall(function() return model.Address end)
+    if ok and value ~= nil then return tostring(value) end
+    return nil
+end
+
+local function appearanceFor(mesh)
+    local c = mesh.Color
+    local texture = ""
+    pcall(function() texture = tostring(mesh.TextureID or "") end)
+    return string.format("%.4f/%.4f/%.4f/%s", c.R, c.G, c.B, texture)
+end
+
+local function sideFromAppearance(mesh)
+    local votes = appearanceVotes[appearanceFor(mesh)]
+    if not votes then return nil end
+    if votes.White > 0 and votes.Black == 0 then return "White" end
+    if votes.Black > 0 and votes.White == 0 then return "Black" end
+    return nil -- Both teams share that appearance; never guess based on red.
+end
+
+local function calibrateSides()
+    local records, counts = {}, {White=0, Black=0}
+    local kingSquares = {}
+    for _, model in ipairs(piecesFolder:GetChildren()) do
+        if validKind(model.Name) then
+            local mesh = model:FindFirstChild("Mesh")
+            local square = mesh and positionToSquare(mesh.Position)
+            if square then
+                local rank = tonumber(square:sub(2, 2))
+                local side = rank <= 4 and "White" or "Black"
+                records[#records + 1] = {model=model, mesh=mesh, square=square, side=side}
+                counts[side] += 1
+                if model.Name == "King" then kingSquares[side] = (kingSquares[side] or 0) + 1 end
+            end
+        end
     end
-    return side .. " " .. kind
+
+    -- This is safe for a fresh board or immediately after White's first move,
+    -- the two intended times to load. In an established middlegame, pieces
+    -- may have crossed the board, so require both starting-side kings.
+    local good = counts.White == 16 and counts.Black == 16
+        and kingSquares.White == 1 and kingSquares.Black == 1
+    if not good then
+        if os.clock() - lastCalibrateWarning > 6 then
+            warn("[Stockfish v5] CALIBRATION NOT READY: White=" .. counts.White ..
+                " Black=" .. counts.Black .. ". Start on a new board or right after White's opening move.")
+            lastCalibrateWarning = os.clock()
+        end
+        return false
+    end
+
+    sideByModel = setmetatable({}, {__mode = "k"})
+    sideByAddress = {}
+    appearanceVotes = {}
+    for _, entry in ipairs(records) do
+        sideByModel[entry.model] = entry.side
+        local address = addressFor(entry.model)
+        if address then sideByAddress[address] = entry.side end
+        local appearance = appearanceFor(entry.mesh)
+        local votes = appearanceVotes[appearance] or {White=0, Black=0}
+        votes[entry.side] += 1
+        appearanceVotes[appearance] = votes
+        if entry.model.Name == "King" then
+            local c = entry.mesh.Color
+            print(string.format("[Stockfish v5] %s King @%s Mesh RGB=(%.3f, %.3f, %.3f)",
+                entry.side, entry.square, c.R, c.G, c.B))
+        end
+    end
+    calibrated = true
+    print("[Stockfish v5] COLOR CALIBRATED: 16 White / 16 Black pieces")
+    return true
+end
+
+local function pieceType(model, square)
+    local mesh = model:FindFirstChild("Mesh")
+    if not mesh or not validKind(model.Name) then return nil end
+    local addr = addressFor(model)
+    local side = sideByModel[model]
+        or (addr and sideByAddress[addr])
+        or sideFromAppearance(mesh)
+    if not side then
+        -- If a piece instance was replaced at its existing square, preserve
+        -- its previously observed team; only infer by board half as last resort.
+        local oldType = cachedSquareTypes[square]
+        if oldType and oldType:match(" (%w+)$") == model.Name then
+            side = oldType:match("^(%w+) ")
+        end
+    end
+    if not side and square then
+        side = tonumber(square:sub(2,2)) <= 4 and "White" or "Black"
+        warn("[Stockfish v5] New piece without known color at " .. square ..
+            "; inferred " .. side .. ".")
+    end
+    if not side then return nil end
+    sideByModel[model] = side
+    if addr then sideByAddress[addr] = side end
+    return side .. " " .. model.Name
 end
 
 local function scan()
-    local result, types = {}, {}
+    if not calibrated then calibrateSides() end
+    local result, types, newSquareTypes = {}, {}, {}
     for _, model in ipairs(piecesFolder:GetChildren()) do
         local mesh = model:FindFirstChild("Mesh")
         local square = mesh and positionToSquare(mesh.Position)
-        local kind = pieceType(model)
+        local kind = square and pieceType(model, square)
         if square and kind then
-            -- Reuse a supplied piece address if available; otherwise use the instance.
-            local addressOK, address = pcall(function() return model.Address end)
-            local token = (addressOK and address) or model
+            local addr = addressFor(model)
+            local token = addr or model
             result[token] = square
             types[token] = kind
+            newSquareTypes[square] = kind
         end
     end
+    if calibrated then cachedSquareTypes = newSquareTypes end
     return result, types
 end
 
@@ -380,6 +483,10 @@ local function recommend(snapshot, types)
     local myVersion = requestVersion
 
     print("[Stockfish] Analyzing", expected, "| selected:", PLAY_AS, "| FEN:", fen)
+    if API_KEY == "YOUR_RAILWAY_API_KEY" then
+        warn("[Stockfish v5] Set your actual Railway API_KEY at top of test.lua")
+        return false
+    end
 
     local result
     for attempt = 1, 2 do
@@ -447,7 +554,7 @@ local function recommend(snapshot, types)
     return true
 end
 
-print("[Stockfish v4] UI initialized, scan starting. API:", API_URL)
+print("[Stockfish v5] UI initialized, scan starting. API:", API_URL)
 local ok, current, types = pcall(scan)
 assert(ok, current)
 
@@ -460,14 +567,14 @@ while running and not usableSnapshot(current, types) do
             if types[token] == "White King" then white += 1 end
             if types[token] == "Black King" then black += 1 end
         end
-        warn("[Stockfish v4] SCAN BLOCKED: pieces=" .. n ..
+        warn("[Stockfish v5] SCAN BLOCKED: pieces=" .. n ..
             " whiteKings=" .. white .. " blackKings=" .. black)
         local samples = {}
         for token, square in pairs(current) do
             samples[#samples+1] = tostring(types[token]) .. "@" .. tostring(square)
             if #samples >= 8 then break end
         end
-        print("[Stockfish v4] Detected piece examples: " .. table.concat(samples, ", "))
+        print("[Stockfish v5] Detected piece examples: " .. table.concat(samples, ", "))
         lastScanWarning = os.clock()
     end
     task.wait(0.5)
@@ -476,7 +583,7 @@ while running and not usableSnapshot(current, types) do
 end
 if not running then return end
 
-print("[Stockfish v4] Scan passed; both kings detected. Tracking turns.")
+print("[Stockfish v5] Scan passed; both kings detected. Tracking turns.")
 previous, previousTypes = current, types
 local initialTurn = detectOpeningTurn(current, types)
 if initialTurn ~= nil then
@@ -526,6 +633,11 @@ while running do
 
     if newGameRequested then
         newGameRequested = false
+        calibrated = false
+        cachedSquareTypes = {}
+        calibrateSides()
+        local refreshedOK, refreshed, refreshedTypes = pcall(scan)
+        if refreshedOK then nextSnapshot, nextTypes = refreshed, refreshedTypes end
         previous, previousTypes = nextSnapshot, nextTypes
         candidateSignature = boardSignature(nextSnapshot, nextTypes)
         candidateSince = os.clock()
